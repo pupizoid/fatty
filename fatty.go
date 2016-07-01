@@ -193,7 +193,12 @@ func processRequest(c *http.Client, options *TestingOptions) {
 	options.Strategy.SetHeader(req)
 	options.Strategy.SetBody(req)
 	// checks
-	
+	switch options.Strategy.(type) {
+	case *GrovingBody:
+		if options.Method == "HEAD" || options.Method == "GET" {
+			log.Fatal("Testing body size not allowed for this method")
+		}
+	}
 	//
 	resp, err := c.Do(req)
 	if err != nil {
