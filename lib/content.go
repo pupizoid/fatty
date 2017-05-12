@@ -21,7 +21,7 @@ type GrowableContent interface {
 	Grow() ([]byte, error)
 }
 
-type Payload struct {
+type Content struct {
 	size          uint
 	incValue      uint
 	multiplyValue uint
@@ -30,13 +30,12 @@ type Payload struct {
 	mutex         *sync.Mutex
 }
 
-func NewPayload(s, i, m uint) *Payload {
-	return &Payload{s, i, m, nil, &sync.Mutex{}}
+func NewContent(s, i, m uint) *Content {
+	return &Content{s, i, m, nil, &sync.Mutex{}}
 }
 
-// Grow is the function that allows header payload grow according to it's settings. This function will be called after
-// every successfull request for every emitter.
-func (h *Payload) Grow() ([]byte, error) {
+// Grow is the function that allows content's payload grow according to it's settings.
+func (h *Content) Grow() ([]byte, error) {
 	h.mutex.Lock()
 	defer h.mutex.Unlock()
 	if h.payload == nil {
@@ -44,7 +43,7 @@ func (h *Payload) Grow() ([]byte, error) {
 		h.payload = genRandomBytes(h.size)
 		return h.payload, nil
 	}
-
+	// increment setting has higher priority
 	if h.incValue > 0 {
 		h.payload = append(h.payload, genRandomBytes(h.incValue)...)
 		h.size += h.incValue
@@ -56,11 +55,12 @@ func (h *Payload) Grow() ([]byte, error) {
 		h.size *= h.multiplyValue
 		return h.payload, nil
 	}
-	// header size doesn't grow
+	// payload doesn't grow
+	// todo: check for some settings overflow, like MaxHeaderSize or so on...
 	return h.payload, nil
 }
 
-var _ GrowableContent = (*Payload)(nil)
+var _ GrowableContent = (*Content)(nil)
 
 const RequestHeaderName string = "Sample-Header"
 

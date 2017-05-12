@@ -2,33 +2,53 @@ package lib
 
 import (
 	"net/http"
-	"github.com/valyala/fasthttp"
 	"time"
+	"net/url"
+	"fmt"
+	"encoding/base64"
+	"github.com/valyala/fasthttp"
 )
 
 type Emitter struct {
-	Destination string
+	Destination *url.URL
 	Method      string
 
-	limit       uint32
+	limit uint32
 
-	client      *fasthttp.Client
+	client *fasthttp.Client
 
-	header      GrowableContent
-	body        GrowableContent
+	header GrowableContent
+	body   GrowableContent
+	proxy  *url.URL
 }
 
-func NewEmitter(d, m string, l uint32, h, b GrowableContent) *Emitter {
-	return &Emitter{Destination: d, Method: m, limit: l, client: &fasthttp.Client{}, header: h, body: b}
+func NewEmitter(m string, l uint32, h, b GrowableContent, d, p *url.URL) *Emitter {
+	client := &fasthttp.Client{}
+
+	if p != nil {
+
+	}
+
+	return &Emitter{Destination: d, Method: m, limit: l, client: client, header: h, body: b, proxy: p}
 }
 
-func (e *Emitter) Start(counter *RequestCounter, stop, done chan struct{}, log chan LogMessage) {
+func (e *Emitter) Start(counter *RequestCounter, proxy *url.URL, stop, done chan struct{}, log chan LogMessage) {
 
 	var start time.Time
 
 	req := fasthttp.AcquireRequest()
-	req.SetRequestURI(e.Destination)
+
+	if e.proxy != nil && e.proxy.User != nil {
+		req.Header.Set("Proxy-Authentication", base64.URLEncoding.EncodeToString([]byte(e.proxy.User.String())))
+	}
+
 	req.Header.SetMethod(e.Method)
+
+	// test
+
+	req.Header.SetHost(e.Destination.Host)
+
+	// test end
 
 	resp := fasthttp.AcquireResponse()
 
@@ -48,12 +68,13 @@ func (e *Emitter) Start(counter *RequestCounter, stop, done chan struct{}, log c
 		if e.body != nil && e.Method == http.MethodPost {
 			bodyContent, err := e.body.Grow()
 			if err != nil {
-				// this can happen in case of overflow or reaching max header size...
+				// this can happen in case of overflow or reaching max body size...
 				log <- LogMessage{err: true, message: err.Error()}
 				done <- struct{}{}
 				return
 			}
-			req.AppendBody(bodyContent)
+			//req.AppendBody(bodyContent)
+			req.SetBody(bodyContent)
 		}
 
 		counter.Add(1)
@@ -61,17 +82,18 @@ func (e *Emitter) Start(counter *RequestCounter, stop, done chan struct{}, log c
 
 		err := e.client.Do(req, resp)
 		if err != nil {
-			log <- LogMessage{err: true, message: err.Error()}
+			log <- LogMessage{err: true, message: fmt.Sprintf("Error processing request: %s", err.Error())}
 			done <- struct{}{}
 			return
 		}
-		estimated := time.Since(start)
+		time_spent := time.Since(start)
 
+		// parse request status
 		switch code := resp.StatusCode(); code {
 		case http.StatusFound, http.StatusOK:
-			log <- LogMessage{ReqTime: estimated, ReqCode: code, err: false}
+			log <- LogMessage{ReqTime: time_spent, ReqCode: code, err: false}
 		default:
-			log <- LogMessage{ReqTime: estimated, ReqCode: code, err: true, message: string(resp.Body())}
+			log <- LogMessage{ReqTime: time_spent, ReqCode: code, err: true, message: string(resp.Body())}
 			done <- struct{}{}
 			return
 		}
@@ -84,9 +106,9 @@ func (e *Emitter) Start(counter *RequestCounter, stop, done chan struct{}, log c
 				return
 			}
 		default:
+			// can work further, so clear response
+			resp.Reset()
 		}
-
-		resp.Reset()
 	}
 	done <- struct{}{}
 }
@@ -99,4 +121,3 @@ type LogMessage struct {
 	err     bool
 	message string
 }
-
