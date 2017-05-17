@@ -4,30 +4,42 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
-	"github.com/fatih/color"
 	"sync"
 	"time"
 	"net/url"
+	"github.com/uber-go/atomic"
 )
 
 type Dispatcher struct {
-	stats *RunStats
+	stats *LoadRunStats
 	Proxy *url.URL
 
-	Emitters []*Emitter
+	Emitters []Emitter
 
-	log chan LogMessage
+	log chan EmitterEvent
+
+	deadLine *time.Timer
 
 	stop, done chan struct{}
 }
 
-func NewDispatcher() *Dispatcher {
-	stats := &RunStats{counter: &RequestCounter{mutex: &sync.RWMutex{}}}
+func NewDispatcher(timeout int) *Dispatcher {
+	//stats := &RunStats{counter: &RequestCounter{mutex: &sync.RWMutex{}}}
+	stats := &LoadRunStats{
+		counter: atomic.NewInt32(0),
+		statusCodes: make(map[int]int),
+		startTime: time.Now(),
+	}
+
+	timer := time.Timer{}
+	if timeout != 0 {
+		timer = *time.NewTimer(time.Second * time.Duration(timeout))
+	}
 
 	done := make(chan struct{})
 	stop := make(chan struct{})
 
-	return &Dispatcher{stats: stats, done: done, stop: stop}
+	return &Dispatcher{stats: stats, done: done, stop: stop, deadLine: &timer}
 }
 
 func (d *Dispatcher) Run() {
@@ -36,25 +48,45 @@ func (d *Dispatcher) Run() {
 	interrupt := make(chan os.Signal, 1)
 	signal.Notify(interrupt, os.Interrupt)
 
-	d.log = make(chan LogMessage, nthreads * 10)
+	d.log = make(chan EmitterEvent, 10000)
 
 	for _, e := range d.Emitters {
-		go e.Start(d.stats.counter, d.Proxy, d.stop, d.done, d.log)
+		go e.Start(d.stop, d.done, d.log)
 	}
 
 	for nthreads > 0 {
 		select {
-		case msg := <-d.log:
-			if msg.err {
-				fmt.Println(color.RedString("Returned request with err code: %d, message: %s", msg.ReqCode, msg.message))
-			} else {
-				d.stats.process(msg)
+		case event := <-d.log:
+			switch msg := event.(type) {
+			case LoadEmitterEvent:
+				if _, ok := d.stats.statusCodes[msg.Code]; ok {
+					d.stats.statusCodes[msg.Code]++
+				} else {
+					d.stats.statusCodes[msg.Code] = 1
+				}
+				d.stats.totalTime += msg.RequestTime
+				if d.stats.minRequestTime > msg.RequestTime || d.stats.minRequestTime == 0 {
+					d.stats.minRequestTime = msg.RequestTime
+				}
+				if d.stats.maxRequestTime < msg.RequestTime {
+					d.stats.maxRequestTime = msg.RequestTime
+				}
+				d.stats.totalBytes += msg.RequestLength
+				d.stats.counter.Add(1)
+			case error:
+				d.stats.errorCounter++
+			default:
+				fmt.Printf("Unknown event: %#v", msg)
 			}
 		case <-d.done:
 			nthreads -= 1
 		case <-interrupt:
 			fmt.Println("Received SIGINT, exiting...")
 			close(d.stop)
+		case <-d.deadLine.C:
+			fmt.Println("Testing ended by time")
+			close(d.stop)
+		default:
 		}
 	}
 
@@ -88,28 +120,32 @@ type RunStats struct {
 	total time.Duration
 }
 
-func (rs *RunStats) process(msg LogMessage) {
-	if msg.ReqTime < rs.minTime {
-		rs.minTime = msg.ReqTime
-	}
-	if rs.minTime == 0 {
-		rs.minTime = msg.ReqTime
-	}
-	if msg.ReqTime > rs.maxTime {
-		rs.maxTime = msg.ReqTime
-	}
+type LoadRunStats struct {
+	counter *atomic.Int32
+	errorCounter int
+	statusCodes map[int]int
+	totalTime time.Duration
+	totalBytes int
 
-	rs.total += msg.ReqTime
+	maxRequestTime time.Duration
+	minRequestTime time.Duration
+
+	startTime time.Time
 }
 
-func (rs *RunStats) Print() {
-	fmt.Printf("Processed requests: %d\n", rs.counter.count)
-	fmt.Printf("Max request time: %s\n", rs.maxTime)
-	fmt.Printf("Min request time: %s\n", rs.minTime)
-
-	if rs.counter.count > 0 {
-		fmt.Printf("Average request time: %s\n", time.Duration(uint32(rs.total) / rs.counter.count))
+func (rs *LoadRunStats) Print() {
+	fmt.Printf("Processed requests: %d\n", rs.counter.Load())
+	fmt.Println("Status code information:")
+	for code, count := range rs.statusCodes {
+		fmt.Printf("%d: %d\n", code, count)
 	}
+	fmt.Printf("Connection errors: %d\n", rs.errorCounter)
+	// count cumulative values
+	bandwidth := float64(rs.totalBytes) / rs.totalTime.Seconds()
+	fmt.Printf("Max request time: %s\n", rs.maxRequestTime)
+	fmt.Printf("Min request time: %s\n", rs.minRequestTime)
+	fmt.Printf("Overal bandwidth: %f bytes/sec\n", bandwidth)
+	fmt.Printf("Time: %s\n", time.Since(rs.startTime))
 }
 
 type ProxySettings struct {

@@ -1,123 +1,161 @@
 package lib
 
 import (
-	"net/http"
-	"time"
 	"net/url"
-	"fmt"
-	"encoding/base64"
 	"github.com/valyala/fasthttp"
+	"encoding/base64"
+	"net/http"
+	"errors"
+	"fmt"
+	"time"
 )
 
-type Emitter struct {
-	Destination *url.URL
-	Method      string
+// Base emitter interface
+type Emitter interface {
+	Start(stop, done chan struct{}, log chan EmitterEvent)
+}
+// Base emitter run options interface
+type EmitterOptions interface {}
 
-	limit uint32
+// Base emitter log message interface
+type EmitterEvent interface {}
 
-	client *fasthttp.Client
+// Base statistic interface for emitter
+type EmitterStats interface {}
 
-	header GrowableContent
-	body   GrowableContent
-	proxy  *url.URL
+type BaseEmitter struct {
+
 }
 
-func NewEmitter(m string, l uint32, h, b GrowableContent, d, p *url.URL) *Emitter {
-	client := &fasthttp.Client{}
+// Load testing emitter
 
-	if p != nil {
+type LoadEmitter struct {
+	client *fasthttp.HostClient
+	proxy *url.URL
 
-	}
-
-	return &Emitter{Destination: d, Method: m, limit: l, client: client, header: h, body: b, proxy: p}
+	options *LoadEmitterOptions
 }
 
-func (e *Emitter) Start(counter *RequestCounter, proxy *url.URL, stop, done chan struct{}, log chan LogMessage) {
+type LoadEmitterOptions struct {
+	Urls chan string
+	Ip string
+	Port string
+}
 
-	var start time.Time
+type LoadEmitterEvent struct {
+	Code int
+	RequestTime time.Duration
+	RequestLength int
+}
+
+func NewLoadEmitter(options *LoadEmitterOptions, proxy *url.URL) Emitter {
+	emitter := &LoadEmitter{}
+	emitter.options = options
+	emitter.proxy = proxy
+	//emitter.client = &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxy)}}
+	emitter.client = &fasthttp.HostClient{Addr: proxy.Host}
+	return emitter
+}
+//
+//func (e *LoadEmitter) Start(stop, done chan struct{}, log chan EmitterEvent) {
+//
+//	var req *http.Request
+//	var resp *http.Response
+//	var err error
+//
+//	for {
+//		select {
+//		case u := <-e.options.Urls:
+//
+//			req, err = http.NewRequest("GET", u, nil)
+//
+//			start := time.Now()
+//			resp, err = e.client.Do(req)
+//			if err != nil {
+//				log <- errors.New(fmt.Sprintf("Error: %s", err))
+//				//done <- struct{}{}
+//				//return
+//			}
+//
+//			ev := LoadEmitterEvent{
+//				Code: resp.StatusCode,
+//				RequestTime: time.Since(start),
+//				RequestLength: resp.ContentLength,
+//			}
+//
+//			//fmt.Printf("Event: %#v", ev)
+//
+//			log <- ev
+//
+//			select {
+//			case _, ok := <-stop:
+//				if !ok {
+//					// channel closed so exit
+//					done <- struct{}{}
+//					return
+//				}
+//			default:
+//			}
+//
+//			resp.Body.Close()
+//		default:
+//			// send message that this emitter has done all work
+//			done <- struct{}{}
+//			return
+//		}
+//	}
+//}
+
+func (e *LoadEmitter) Start(stop, done chan struct{}, log chan EmitterEvent) {
 
 	req := fasthttp.AcquireRequest()
+	resp := fasthttp.AcquireResponse()
 
 	if e.proxy != nil && e.proxy.User != nil {
 		req.Header.Set("Proxy-Authentication", base64.URLEncoding.EncodeToString([]byte(e.proxy.User.String())))
 	}
 
-	req.Header.SetMethod(e.Method)
+	req.Header.SetMethod(http.MethodGet)
 
-	// test
-
-	req.Header.SetHost(e.Destination.Host)
-
-	// test end
-
-	resp := fasthttp.AcquireResponse()
-
-	for counter.Load() < e.limit {
-		// apply header if it persists in run configuration
-		if e.header != nil {
-			headerContent, err := e.header.Grow()
-			if err != nil {
-				// this can happen in case of overflow or reaching max header size...
-				log <- LogMessage{err: true, message: err.Error()}
-				done <- struct{}{}
-				return
-			}
-			req.Header.SetBytesV(RequestHeaderName, headerContent)
-		}
-		// apply body to request if it persists in run configuration
-		if e.body != nil && e.Method == http.MethodPost {
-			bodyContent, err := e.body.Grow()
-			if err != nil {
-				// this can happen in case of overflow or reaching max body size...
-				log <- LogMessage{err: true, message: err.Error()}
-				done <- struct{}{}
-				return
-			}
-			//req.AppendBody(bodyContent)
-			req.SetBody(bodyContent)
-		}
-
-		counter.Add(1)
-		start = time.Now()
-
-		err := e.client.Do(req, resp)
-		if err != nil {
-			log <- LogMessage{err: true, message: fmt.Sprintf("Error processing request: %s", err.Error())}
-			done <- struct{}{}
-			return
-		}
-		time_spent := time.Since(start)
-
-		// parse request status
-		switch code := resp.StatusCode(); code {
-		case http.StatusFound, http.StatusOK:
-			log <- LogMessage{ReqTime: time_spent, ReqCode: code, err: false}
-		default:
-			log <- LogMessage{ReqTime: time_spent, ReqCode: code, err: true, message: string(resp.Body())}
-			done <- struct{}{}
-			return
-		}
-
+	for {
 		select {
-		case _, ok := <-stop:
-			if !ok {
-				// channel closed so exit
-				done <- struct{}{}
-				return
+		case u := <-e.options.Urls:
+
+			req.SetRequestURI(u)
+
+			start := time.Now()
+			err := e.client.Do(req, resp)
+			if err != nil {
+				log <- errors.New(fmt.Sprintf("Error: %s", err))
+				//done <- struct{}{}
+				//return
 			}
-		default:
-			// can work further, so clear response
+
+			ev := LoadEmitterEvent{
+				Code: resp.StatusCode(),
+				RequestTime: time.Since(start),
+				RequestLength: resp.Header.ContentLength(),
+			}
+
+			//fmt.Printf("Event: %#v", ev)
+
+			log <- ev
+
+			select {
+			case _, ok := <-stop:
+				if !ok {
+					// channel closed so exit
+					done <- struct{}{}
+					return
+				}
+			default:
+			}
+
 			resp.Reset()
+		default:
+			// send message that this emitter has done all work
+			done <- struct{}{}
+			return
 		}
 	}
-	done <- struct{}{}
-}
-
-// todo: implement log message interface
-type LogMessage struct {
-	ReqTime time.Duration
-	ReqCode int
-
-	err     bool
-	message string
 }
